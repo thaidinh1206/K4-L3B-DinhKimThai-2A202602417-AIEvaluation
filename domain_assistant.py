@@ -244,26 +244,105 @@ class TextGenerator(Protocol):
 
 class OpenAIGenerator:
     def __init__(self, max_output_tokens: int = 300) -> None:
-        api_key = os.getenv("OPENAI_API_KEY", "").strip()
-        self.model = os.getenv("OPENAI_MODEL", "").strip()
+        api_key = (
+            os.getenv("OPENROUTER_API_KEY", "").strip()
+            or os.getenv("OPENAI_API_KEY", "").strip()
+        )
+        self.model = (
+            os.getenv("OPENROUTER_MODEL", "").strip()
+            or os.getenv("OPENAI_MODEL", "").strip()
+        )
         if not api_key:
-            raise RuntimeError("OPENAI_API_KEY is missing from .env")
+            raise RuntimeError("OPENAI_API_KEY or OPENROUTER_API_KEY is missing from .env")
         if not self.model:
-            raise RuntimeError("OPENAI_MODEL is missing from .env")
-        self.client = OpenAI(api_key=api_key)
+            raise RuntimeError("OPENAI_MODEL or OPENROUTER_MODEL is missing from .env")
+
+        base_url = (
+            os.getenv("OPENAI_BASE_URL", "").strip()
+            or os.getenv("OPENROUTER_BASE_URL", "").strip()
+            or ("https://openrouter.ai/api/v1" if api_key.startswith("sk-or-") or "openrouter" in self.model.lower() else None)
+        )
+        self.base_url = base_url
+        if base_url:
+            self.client = OpenAI(api_key=api_key, base_url=base_url)
+        else:
+            self.client = OpenAI(api_key=api_key)
         self.max_output_tokens = max_output_tokens
 
     def generate(self, prompt: str) -> str:
-        response = self.client.responses.create(
-            model=self.model,
-            input=prompt,
-            temperature=0,
-            max_output_tokens=self.max_output_tokens,
-        )
-        answer = response.output_text.strip()
-        if not answer:
-            raise RuntimeError("OpenAI returned an empty answer")
-        return answer
+        max_attempts = 6
+        for attempt in range(max_attempts):
+            try:
+                # Use Chat Completions if using OpenRouter / custom base_url
+                if self.base_url or "openrouter" in self.model.lower() or not hasattr(self.client, "responses"):
+                    response = self.client.chat.completions.create(
+                        model=self.model,
+                        messages=[{"role": "user", "content": prompt}],
+                        temperature=0,
+                        max_tokens=max(self.max_output_tokens, 600),
+                    )
+                    choice = response.choices[0]
+                    answer = choice.message.content or ""
+                    # Handle models that put output in reasoning fields
+                    if not answer.strip():
+                        answer = getattr(choice.message, "reasoning_content", "") or ""
+                    if not answer.strip():
+                        answer = getattr(choice.message, "reasoning", "") or ""
+
+                    if answer and answer.strip():
+                        # Strip thinking tags if present
+                        cleaned_answer = re.sub(r"<think>.*?</think>", "", answer, flags=re.DOTALL).strip()
+                        if not cleaned_answer:
+                            cleaned_answer = answer.strip()
+                        time.sleep(2)  # brief pause to avoid bursting rate limits
+                        return cleaned_answer
+
+                    print(f" [Empty response received from {self.model}, retrying {attempt + 1}/{max_attempts}]...", flush=True)
+                    time.sleep(4)
+                    continue
+
+                try:
+                    response = self.client.responses.create(
+                        model=self.model,
+                        input=prompt,
+                        temperature=0,
+                        max_output_tokens=self.max_output_tokens,
+                    )
+                    answer = response.output_text.strip()
+                    if answer:
+                        time.sleep(2)
+                        return answer
+                except Exception:
+                    # Fallback to chat completions
+                    response = self.client.chat.completions.create(
+                        model=self.model,
+                        messages=[{"role": "user", "content": prompt}],
+                        temperature=0,
+                        max_tokens=self.max_output_tokens,
+                    )
+                    answer = response.choices[0].message.content or ""
+                    if answer.strip():
+                        time.sleep(2)
+                        return answer.strip()
+
+                print(f" [Empty response received, retrying {attempt + 1}/{max_attempts}]...", flush=True)
+                time.sleep(4)
+                continue
+
+            except Exception as exc:
+                err_str = str(exc)
+                if ("429" in err_str or "rate" in err_str.lower() or "limit" in err_str.lower() or "temporarily" in err_str.lower()) and attempt < max_attempts - 1:
+                    wait_sec = (attempt + 1) * 8
+                    print(f" [Rate-limited: waiting {wait_sec}s before retry {attempt + 1}/{max_attempts}]...", flush=True)
+                    time.sleep(wait_sec)
+                    continue
+                if attempt < max_attempts - 1:
+                    print(f" [Error {exc}, retrying {attempt + 1}/{max_attempts}]...", flush=True)
+                    time.sleep(5)
+                    continue
+                raise
+
+        raise RuntimeError(f"Model {self.model} failed to generate an answer after {max_attempts} attempts.")
 
 
 @dataclass(frozen=True)
